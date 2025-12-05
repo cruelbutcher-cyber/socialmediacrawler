@@ -1,320 +1,426 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-X/Twitter Outgoing Link Scanner – 100% Accuracy Edition
-No Selenium • Uses X's hidden GraphQL API • Full affiliate + redirect resolution
-Identical detection power to your original 671-line Tkinter crawler
+Enhanced Social Media Crawler with Streamlit GUI
+Searches for specified keywords in URLs, content, and redirects on a social media profile.
+Features:
+- Web scraping with BeautifulSoup
+- Selenium for dynamic loading
+- Configurable keywords
+- CSV export of results
 """
 
 import streamlit as st
 import requests
-import json
+from bs4 import BeautifulSoup, FeatureNotFound
+from urllib.parse import urljoin, urlparse, parse_qs, unquote, urlunparse
+from collections import deque
+import csv
+import datetime
 import re
 import time
-import hashlib
-from urllib.parse import urljoin, urlparse, parse_qs, unquote
-from bs4 import BeautifulSoup
-from datetime import datetime
-import csv
 from io import StringIO
+import hashlib
+import html
+import tldextract
+from urllib3.util import Retry
+from requests.adapters import HTTPAdapter
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
 
-st.set_page_config(page_title="X Link Scanner Pro", page_icon="detective", layout="wide")
-st.title("X/Twitter Outgoing Link Scanner – 100% Accuracy")
-st.markdown("**Zero compromise.** Finds `gowithguide` (or any keyword) in **final URLs after all redirects — just like your original desktop crawler.")
-
-# ====================== CONFIG & SESSION ======================
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
-    "Accept": "application/json",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://x.com/",
-    "Origin": "https://x.com",
-    "Sec-Fetch-Site": "same-origin",
-    "X-Twitter-Active-User": "yes",
-    "X-Twitter-Client-Language": "en",
-})
-
-# ====================== ORIGINAL DETECTION LOGIC (100% preserved) ======================
-KNOWN_SHORTENERS = [
-    'bit.ly', 'tinyurl.com', 'goo.gl', 't.co', 'ow.ly', 'is.gd',
-    'buff.ly', 'adf.ly', 'bit.do', 'mcaf.ee', 'su.pr', 'tiny.cc',
-    'tidd.ly', 'redirectingat.com', 'go.redirectingat.com', 'go.skimresources.com'
-]
-AWIN_DOMAINS = ['awin1.com', 'zenaps.com']
-AFFILIATE_PREFIXES = ['track.', 'go.', 'click.', 'buy.', 'shop.', 'link.', 'visit.', 'affiliate.', 'partners.', 'redirect.', 'ref.']
-
-def is_suspicious_url(url):
-    try:
-        p = urlparse(url.lower())
-        netloc = p.netloc
-        path = p.path.lower()
-
-        if any(s in netloc for s in KNOWN_SHORTENERS):
-            return True
-        if any(d in netloc for d in AWIN_DOMAINS):
-            return True
-        if any(netloc.startswith(pre) for pre in AFFILIATE_PREFIXES):
-            return True
-        if any(seg in path for seg in ['/go', '/out', '/click', '/redirect', '/visit', '/awc']):
-            return True
-        if 'utm_' in url or 'ref=' in url or 'aff=' in url:
-            return True
-        return False
-    except:
-        return False
-
-def resolve_final_url(url, depth=0):
-    if depth > 10:
-        return url
-    try:
-        # HEAD first
-        r = SESSION.head(url, allow_redirects=False, timeout=10)
-        if r.status_code in (301, 302, 303, 307, 308):
-            location = r.headers.get('Location', '')
-            if location:
-                return resolve_final_url(urljoin(url, location), depth + 1)
-        # GET fallback
-        r = SESSION.get(url, timeout=12)
-        final = r.url
-
-        # Parse meta refresh & JS redirects
-        soup = BeautifulSoup(r.text, "html.parser")
-        # Meta refresh
-        meta = soup.find("meta", attrs={"http-equiv": re.compile(r"refresh", re.I)})
-        if meta and meta.get("content"):
-            if "url=" in meta["content"]:
-                url_part = meta["content"].split("url=",1)[1].strip(" '\"")
-                return resolve_final_url(urljoin(url, url_part), depth + 1)
-
-        # JS redirect patterns
-        scripts = soup.find_all("script")
-        for s in scripts:
-            if not s.string: continue
-            patterns = [
-                r'window\.location\s*=\s*["\']([^"\']+)',
-                r'window\.location\.replace\(["\']([^"\']+)',
-                r'location\.href\s*=\s*["\']([^"\']+)',
-                r'document\.location\s*=\s*["\']([^"\']+)',
-            ]
-            for pat in patterns:
-                m = re.search(pat, s.string)
-                if m:
-                    return resolve_final_url(urljoin(url, m.group(1)), depth + 1)
-        return final
-    except:
-        return url
-
-def match_keywords(text, keywords):
-    text_l = text.lower()
-    return [kw for kw in keywords if kw.lower() in text_l]
-
-# ====================== X API CRAWLER (replaces Selenium scrolling) ======================
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_guest_token():
-    try:
-        r = SESSION.post("https://api.x.com/1.1/guest/activate.json", timeout=10)
-        return r.json().get("guest_token")
-    except:
-        return None
-
-def get_auth_headers():
-    token = get_guest_token()
-    if not token:
-        st.error("Failed to get guest token. X may be rate-limiting.")
-        st.stop()
-    return {
-        "Authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
-        "X-Guest-Token": token,
-        "Content-Type": "application/json",
-    }
-
-def fetch_tweets(user_id, cursor=None):
-    variables = {
-        "userId": user_id,
-        "count": 100,
-        "includePromotedContent": False,
-        "withQuickPromoteEligibilityTweetFields": False,
-        "withVoice": True,
-        "withV2": True
-    }
-    if cursor:
-        variables["cursor"] = cursor
-
-    params = {
-        "variables": json.dumps(variables),
-        "features": json.dumps({
-            "rweb_tipjar_consumption_enabled": True,
-            "responsive_web_graphql_exclude_directive_enabled": True,
-            "verified_phone_label_enabled": False,
-            "responsive_web_graphql_timeline_navigation_enabled": True,
-            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-            "responsive_web_enhance_cards_enabled": False
-        })
-    }
-
-    url = "https://x.com/i/api/graphql/9zw7OjO2J8I9nHQ2k7tW7Q/UserTweetsAndReplies"
-    try:
-        r = SESSION.get(url, headers=get_auth_headers(), params=params, timeout=15)
-        return r.json()
-    except:
-        return {}
-
-def extract_links_from_tweet_entities(entities):
-    links = []
-    if "urls" in entities:
-        for u in entities["urls"]:
-            if "expanded_url" in u:
-                links.append(u["expanded_url"])
-    return links
-
-def crawl_profile(username_or_url):
-    # Normalize username
-    username = username_or_url.strip().replace("https://", "").replace("http://", "").replace("x.com/", "").replace("twitter.com/", "").split("/")[0].split("?")[0]
-    if username.startswith("@"):
-        username = username[1:]
-
-    # Get user ID via search (X requires user ID, not username)
-    search_url = f"https://x.com/i/api/1.1/users/search.json?q={username}&count=1"
-    try:
-        r = SESSION.get(search_url, headers=get_auth_headers())
-        users = r.json()
-        if not users:
-            st.error(f"User @{username} not found or private.")
-            st.stop()
-        user_id = users[0]["id_str"]
-    except:
-        st.error("Failed to resolve username to user ID.")
-        st.stop()
-
-    all_links = set()
-    cursor = None
-    seen_tweet_ids = set()
-
-    progress = st.progress(0)
-    status = st.empty()
-    tweet_count = 0
-
-    status.info("Fetching tweets using X's internal API...")
-
-    while True:
-        data = fetch_tweets(user_id, cursor)
-        instructions = data.get("data", {}).get("user", {}).get("result", {}).get("timeline_v2", {}) \
-                        .get("timeline", {}).get("instructions", [])
-
-        found_new = False
-        for instr in instructions:
-            if instr.get("type") == "TimelineAddEntries":
-                for entry in instr.get("entries", []):
-                    if entry.get("entryId", "").startswith("tweet-"):
-                        content = entry.get("content", {})
-                        item = content.get("itemContent", {}).get("tweet_results", {}).get("result", {})
-                        legacy = item.get("legacy", {})
-                        tweet_id = legacy.get("id_str")
-                        if tweet_id and tweet_id not in seen_tweet_ids:
-                            seen_tweet_ids.add(tweet_id)
-                            tweet_count += 1
-                            entities = legacy.get("entities", {})
-                            links = extract_links_from_tweet_entities(entities)
-                            all_links.update(links)
-                            found_new = True
-
-        # Find next cursor
-        cursor = None
-        for instr in instructions:
-            if instr.get("type") == "TimelineTerminateTimeline":
-                break
-            if instr.get("type") == "TimelineAddEntries":
-                for entry in instr.get("entries", []):
-                    if entry.get("entryId", "").startswith("cursor-bottom-"):
-                        cursor = entry.get("content", {}).get("value")
-                        break
-                if cursor:
-                    break
-
-        progress.progress(min(tweet_count / 1000, 1.0))
-        status.info(f"Fetched {tweet_count}+ tweets...")
-
-        if not found_new or not cursor:
-            break
-        time.sleep(1.2)  # Be respectful
-
-    return list(all_links)
-
-# ====================== MAIN UI ======================
-with st.sidebar:
-    st.header("Scan Settings")
-    profile_input = st.text_input(
-        "X/Twitter Profile",
-        placeholder="elonmusk or https://x.com/verge",
-        help="Public profiles only"
-    )
-    keywords_input = st.text_area(
-        "Keywords (one per line)",
-        value="gowithguide\ngo with guide\ngo-with-guide",
-        height=160
-    )
-    start = st.button("Start Full Scan (100% Coverage)", type="primary", use_container_width=True)
-
-if start:
-    if not profile_input.strip():
-        st.error("Enter a profile")
-        st.stop()
-    if not keywords_input.strip():
-        st.error("Enter keywords")
-        st.stop()
-
-    keywords = [k.strip() for k in keywords_input.splitlines() if k.strip()]
-    if not keywords:
-        st.error("No keywords")
-        st.stop()
-
-    with st.status("Running 100% accurate scan...", expanded=True) as status:
-        st.write("Step 1/3: Resolving username...")
-        links = crawl_profile(profile_input)
-
-        st.write(f"Step 2/3: Found {len(links)} outgoing links. Resolving redirects...")
-        results = []
-        progress_bar = st.progress(0)
-
-        for i, link in enumerate(links):
-            final_url = resolve_final_url(link)
-            matched = match_keywords(final_url, keywords)
-            if matched:
-                results.append({
-                    "source_profile": f"https://x.com/{profile_input.split('/')[-1]}",
-                    "original_url": link,
-                    "final_url": final_url,
-                    "keyword": ", ".join(matched),
-                    "type": "after_full_redirect" if final_url != link else "direct_match",
-                    "timestamp": datetime.now().isoformat()
-                })
-            progress_bar.progress((i + 1) / len(links))
-
-        st.write("Step 3/3: Complete!")
-
-    # ====================== RESULTS ======================
-    if results:
-        st.success(f"Found **{len(results)} real matches** (100% accurate)")
-        for r in results:
-            with st.expander(f"{r['keyword']} ← {r['type'].replace('_', ' ')}"):
-                st.caption("Original (shortened) URL:")
-                st.code(r["original_url"])
-                st.write("**Final URL after all redirects:**")
-                st.write(r["final_url"])
-
-        # CSV Export
-        output = StringIO()
-        writer = csv.DictWriter(output, fieldnames=["source_profile", "original_url", "final_url", "keyword", "type", "timestamp"])
-        writer.writeheader()
-        writer.writerows(results)
-        st.download_button(
-            "Download All Matches (CSV)",
-            data=output.getvalue(),
-            file_name=f"x_links_100percent_{datetime.now():%Y%m%d_%H%M}.csv",
-            mime="text/csv"
+class EnhancedWebCrawler:
+    def __init__(self, start_url, keywords=None, status_callback=None):
+        self.session = self._create_session()
+        self.start_url = start_url
+        self.keywords = keywords if keywords else ["gowithguide", "go with guide", "go-with-guide"]
+        self.main_domain = urlparse(start_url).netloc
+        self.max_pages = 5000  # Equivalent to original "Complete" mode
+        self.visited = set()
+        self.results = []
+        self.queue = deque([start_url])
+        self.user_stopped = False
+        self.pages_crawled = 0
+        self.redirect_cache = {}
+        self.internal_links = set()
+        self.known_shorteners = [
+            'bit.ly', 'tinyurl.com', 'goo.gl', 't.co', 'ow.ly', 'is.gd',
+            'buff.ly', 'adf.ly', 'bit.do', 'mcaf.ee', 'su.pr', 'tiny.cc',
+            'tidd.ly', 'redirectingat.com', 'go.redirectingat.com', 'go.skimresources.com'
+        ]
+        self.awin_domains = ['awin1.com', 'zenaps.com']
+        self.potential_affiliate_domains = [
+            'track.', 'go.', 'click.', 'buy.', 'shop.', 'link.', 'visit.',
+            'affiliate.', 'partners.', 'tracking.', 'redirect.', 'ref.'
+        ]
+        self.potential_affiliate_paths = [
+            '/visit', '/go', '/goto', '/redirect', '/click', '/buy', '/shop',
+            '/link', '/affiliate', '/partner', '/tracking', '/ref', '/out'
+        ]
+        self.potential_affiliate_params = [
+            'site', 'url', 'link', 'goto', 'target', 'redirect', 'redirect_to',
+            'dest', 'destination', 'u', 'to', 'out', 'away', 'href'
+        ]
+        self.crawled_pages_content = {}
+        self.url_fragments_checked = set()
+        self.status_callback = status_callback
+        self.driver = None
+        self._detect_social_media()
+    
+    def _detect_social_media(self):
+        parsed = urlparse(self.start_url)
+        path_parts = parsed.path.strip('/').split('/')
+        if 'x.com' in self.main_domain or 'twitter.com' in self.main_domain:
+            if path_parts:
+                self.username = path_parts[0]
+            if self.username:
+                self.start_url = f'https://{self.main_domain}/{self.username}/with_replies'
+                self.queue = deque([self.start_url])
+    
+    def _create_session(self):
+        session = requests.Session()
+        retries = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "HEAD"]
         )
-    else:
-        st.warning("No matches found. The profile may not have shared your keyword yet.")
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'max-age=0'
+        })
+        return session
+    
+    def get_soup(self, html_content):
+        try:
+            return BeautifulSoup(html_content, 'lxml')
+        except FeatureNotFound:
+            if self.status_callback:
+                self.status_callback("Warning: 'lxml' parser not found. Using 'html.parser' instead.")
+            return BeautifulSoup(html_content, 'html.parser')
+    
+    def is_same_domain(self, url):
+        main_domain_parts = tldextract.extract(self.start_url)
+        url_domain_parts = tldextract.extract(url)
+        return (main_domain_parts.domain == url_domain_parts.domain and
+                main_domain_parts.suffix == url_domain_parts.suffix)
+    
+    def is_subdomain_of(self, url_netloc):
+        main_domain = self.main_domain.replace("www.", "").lower()
+        url_netloc = url_netloc.replace("www.", "").lower()
+        return url_netloc.endswith("." + main_domain) or url_netloc == main_domain
+    
+    def is_relevant_path(self, url):
+        parsed_url = urlparse(url)
+        path = parsed_url.path.lower()
+        if re.search(r'\.(jpg|jpeg|png|gif|svg|pdf|zip|rar|css|js|xml|json)$', path):
+            return False
+        if re.search(r'/(login|logout|register|signin|signout|cart|checkout|privacy|terms)/?$', path):
+            return False
+        if re.search(r'/(post|article|blog|news|story|travel|guide|destination|affiliate|status|video|reel|short|channel|playlist)/', path):
+            return True
+        if len(parse_qs(parsed_url.query)) > 3:
+            return False
+        return True
+    
+    def normalize_url(self, url):
+        parsed = urlparse(url)
+        normalized = urlunparse((parsed.scheme, parsed.netloc, parsed.path,
+                                parsed.params, parsed.query, ''))
+        if normalized.endswith('/'):
+            normalized = normalized[:-1]
+        return normalized
+    
+    def looks_like_affiliate_url(self, url):
+        url_lower = url.lower()
+        parsed_url = urlparse(url_lower)
+        netloc = parsed_url.netloc
+        path = parsed_url.path
+        
+        if any(shortener in netloc for shortener in self.known_shorteners):
+            return True
+        
+        if any(tracker in netloc for tracker in self.potential_affiliate_domains):
+            return True
+        
+        if any(domain in netloc for domain in self.awin_domains):
+            query_params = parse_qs(parsed_url.query)
+            if 'v' in query_params and query_params['v'][0] == '87121':
+                return True
+            if 'awinmid' in query_params and query_params['awinmid'][0] == '87121':
+                return True
+        
+        if any(aff_path in path for aff_path in self.potential_affiliate_paths):
+            return True
+        
+        query_params = parse_qs(parsed_url.query)
+        affiliate_params = ['aff', 'affid', 'affiliateid', 'ref', 'refid', 'referral',
+                           'referralid', 'partner', 'partnerId', 'utm_source']
+        for param in affiliate_params:
+            if param in query_params:
+                return True
+        
+        for param in self.potential_affiliate_params:
+            if param in query_params:
+                param_value = query_params[param][0].lower()
+                if any(keyword in param_value for keyword in self.keywords):
+                    return True
+        
+        tracking_params = ['utm_', 'ref', 'aff', 'source', 'campaign', 'medium']
+        tracking_count = sum(1 for param in query_params if any(t in param for t in tracking_params))
+        if tracking_count >= 2:
+            return True
+        
+        if 'awc' in query_params:
+            awc_value = query_params['awc'][0]
+            if '87121' in awc_value:
+                return True
+        
+        return False
+    
+    def extract_redirection_url(self, html_content, url):
+        soup = self.get_soup(html_content)
+        redirect_urls = []
+        meta_refresh = soup.find('meta', attrs={'http-equiv': re.compile('^refresh$', re.I)})
+        if meta_refresh and meta_refresh.get('content'):
+            match = re.search(r'url=(.+)', meta_refresh['content'], re.I)
+            if match:
+                redirect_url = match.group(1).strip()
+                redirect_urls.append(urljoin(url, redirect_url))
+        script_patterns = [
+            r'window\.location(?:\.href)?\s*=\s*[\'"](.+?)[\'"]',
+            r'window\.location\.replace\([\'"](.+?)[\'"]\)',
+            r'window\.open\([\'"](.+?)[\'"]\)',
+            r'location\.href\s*=\s*[\'"](.+?)[\'"]',
+            r'location\.replace\([\'"](.+?)[\'"]\)',
+            r'setTimeout\([\'"]window\.location\.href=[\'"](.+?)[\'"][\'"]',
+            r'url:\s*[\'"](.+?)[\'"]',
+            r'href=[\'"](.+?)[\'"]'
+        ]
+        scripts = soup.find_all('script')
+        for script in scripts:
+            if script.string:
+                for pattern in script_patterns:
+                    matches = re.findall(pattern, script.string)
+                    for match in matches:
+                        if len(match) > 10:
+                            redirect_urls.append(urljoin(url, match))
+        parsed_url = urlparse(url)
+        query_params = parse_qs(parsed_url.query)
+        redirect_params = ['redirect_to', 'redirect', 'url', 'link', 'goto', 'target', 'ued']
+        for param in redirect_params:
+            if param in query_params:
+                decoded_url = unquote(query_params[param][0])
+                redirect_urls.append(urljoin(url, decoded_url))
+        return redirect_urls
+    
+    def check_url_for_keywords(self, url, source_url):
+        if not url or not isinstance(url, str):
+            return
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        if url_hash in self.url_fragments_checked:
+            return
+        self.url_fragments_checked.add(url_hash)
+        matched_kws = self.get_matched_keywords(url)
+        if matched_kws:
+            self.add_result(
+                source_url=source_url,
+                matched_url=url,
+                element='url',
+                attribute='href',
+                content=url,
+                keywords=matched_kws,
+                location_type='direct_url'
+            )
+        if self.looks_like_affiliate_url(url):
+            final_url = self.resolve_redirects(url)
+            if final_url != url:
+                matched_kws_final = self.get_matched_keywords(final_url)
+                if matched_kws_final:
+                    self.add_result(
+                        source_url=source_url,
+                        matched_url=final_url,
+                        element='url',
+                        attribute='href',
+                        content=f"Redirected from: {url} to: {final_url}",
+                        keywords=matched_kws_final,
+                        location_type='redirected_url'
+                    )
+    
+    def get_matched_keywords(self, text):
+        if not text or not isinstance(text, str):
+            return []
+        matched = []
+        text_lower = text.lower()
+        for keyword in self.keywords:
+            if keyword.lower() in text_lower:
+                matched.append(keyword)
+        return matched
+    
+    def add_result(self, source_url, matched_url, element, attribute, content, keywords, location_type):
+        result = {
+            'source_url': source_url,
+            'matched_url': matched_url,
+            'keyword': ', '.join(keywords),
+            'location_type': location_type,
+            'element': element,
+            'attribute': attribute,
+            'content': content,
+            'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        self.results.append(result)
+        if self.status_callback:
+            self.status_callback(f"Found match: {matched_url} (Keyword: {result['keyword']})")
+    
+    def resolve_redirects(self, url):
+        if url in self.redirect_cache:
+            return self.redirect_cache[url]
+        try:
+            response = self.session.head(url, allow_redirects=True, timeout=5)
+            final_url = response.url
+            self.redirect_cache[url] = final_url
+        except requests.RequestException:
+            final_url = url
+            self.redirect_cache[url] = url
+        return final_url
+    
+    def process_url(self, url):
+        if url in self.visited or self.pages_crawled >= self.max_pages or not url or self.user_stopped:
+            return []
+        self.visited.add(url)
+        self.pages_crawled += 1
+        if self.status_callback:
+            self.status_callback(f"Processing page {self.pages_crawled}: {url}")
+        try:
+            # Use Selenium for dynamic loading
+            options = Options()
+            options.add_argument("--headless")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            options.binary_location = "/usr/bin/chromium-browser"  # For cloud compatibility
+            self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+            self.driver.get(url)
+            time.sleep(2)  # Initial load
+            last_height = self.driver.execute_script("return document.body.scrollHeight")
+            while not self.user_stopped:
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(2)
+                new_height = self.driver.execute_script("return document.body.scrollHeight")
+                if new_height == last_height:
+                    break
+                last_height = new_height
+            html_content = self.driver.page_source
+            self.driver.quit()
+            self.driver = None
+            
+            soup = self.get_soup(html_content)
+            matched_kws = self.get_matched_keywords(html_content)
+            if matched_kws:
+                self.add_result(
+                    source_url=url,
+                    matched_url=url,
+                    element='page_content',
+                    attribute='text',
+                    content=html_content[:200],
+                    keywords=matched_kws,
+                    location_type='content'
+                )
+            redirect_urls = self.extract_redirection_url(html_content, url)
+            for redirect_url in redirect_urls:
+                self.check_url_for_keywords(redirect_url, url)
+            links = []
+            for a_tag in soup.find_all('a', href=True):
+                href = a_tag.get('href')
+                if not href:
+                    continue
+                absolute_url = urljoin(url, href)
+                absolute_url = self.normalize_url(absolute_url)
+                if (self.is_same_domain(absolute_url) or self.is_subdomain_of(urlparse(absolute_url).netloc)) and self.is_relevant_path(absolute_url):
+                    links.append(absolute_url)
+                    self.internal_links.add(absolute_url)
+                self.check_url_for_keywords(absolute_url, url)
+            return links
+        except Exception as e:
+            if self.status_callback:
+                self.status_callback(f"Error processing {url}: {str(e)}")
+            return []
+    
+    def start_crawling(self):
+        self.reset_state()
+        if self.status_callback:
+            self.status_callback(f"Starting crawl of {self.start_url}")
+        while self.queue and not self.user_stopped and self.pages_crawled < self.max_pages:
+            url = self.queue.popleft()
+            new_urls = self.process_url(url)
+            for new_url in new_urls:
+                if (new_url not in self.visited and new_url not in self.queue and
+                        self.pages_crawled < self.max_pages):
+                    self.queue.append(new_url)
+            if self.results:
+                if self.status_callback:
+                    self.status_callback(f"Found {len(self.results)} matches")
+        if self.status_callback:
+            self.status_callback("Crawling completed")
+        return self.results
+    
+    def reset_state(self):
+        self.visited = set()
+        self.queue = deque([self.start_url])
+        self.results = []
+        self.pages_crawled = 0
+        self.redirect_cache = {}
+        self.internal_links = set()
+        self.crawled_pages_content = {}
+        self.url_fragments_checked = set()
 
-st.caption("No Selenium • 100% Final URL Accuracy • Works on Streamlit Cloud • Made with love for investigators")
+def generate_csv(results):
+    csv_file = StringIO()
+    writer = csv.DictWriter(csv_file, fieldnames=[
+        'source_url', 'matched_url', 'keyword',
+        'location_type', 'element', 'attribute',
+        'content_sample', 'timestamp'
+    ])
+    writer.writeheader()
+    for result in results:
+        writer.writerow({
+            'source_url': result['source_url'],
+            'matched_url': result['matched_url'],
+            'keyword': result['keyword'],
+            'location_type': result['location_type'],
+            'element': result['element'],
+            'attribute': result['attribute'],
+            'content_sample': result['content'][:300] if result['content'] else '',
+            'timestamp': result['timestamp']
+        })
+    return csv_file.getvalue()
+
+# Streamlit GUI
+st.header("Crawler Settings")
+profile_url = st.text_input("Social Media Profile URL", value="https://www.youtube.com/@example")
+keywords_input = st.text_area("Keywords (comma-separated)", value="gowithguide, go with guide, go-with-guide")
+
+if st.button("Start Crawling"):
+    keywords = [k.strip() for k in keywords_input.split(',') if k.strip()]
+    if not profile_url or not keywords:
+        st.error("Please provide a URL and keywords.")
+    else:
+        crawler = EnhancedWebCrawler(profile_url, keywords, status_callback=st.write)
+        results = crawler.start_crawling()
+        if results:
+            st.success(f"Found {len(results)} matches.")
+            csv_data = generate_csv(results)
+            st.download_button("Download CSV", csv_data, file_name="crawl_results.csv", mime="text/csv")
+        else:
+            st.info("No matches found.")
