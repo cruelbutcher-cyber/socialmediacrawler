@@ -71,7 +71,7 @@ def resolve_final_url(url, depth=0):
         # HEAD first
         r = SESSION.head(url, allow_redirects=False, timeout=10)
         if r.status_code in (301, 302, 303, 307, 308):
-            location = r.headers.get("Location", "")
+            location = r.headers.get('Location', '')
             if location:
                 return resolve_final_url(urljoin(url, location), depth + 1)
         # GET fallback
@@ -175,7 +175,6 @@ def crawl_profile(username_or_url):
         username = username[1:]
 
     # Get user ID via search (X requires user ID, not username)
-    search)
     search_url = f"https://x.com/i/api/1.1/users/search.json?q={username}&count=1"
     try:
         r = SESSION.get(search_url, headers=get_auth_headers())
